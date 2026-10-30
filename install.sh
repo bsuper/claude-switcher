@@ -30,8 +30,14 @@ open "$HOME/Applications/ClaudeSwitcher.app"
 cat <<'MSG'
 ✓ Claude Switcher is running — look for the ring icon in your menu bar.
 
+macOS is about to ask for permissions, one at a time. Approve each one now so
+nothing interrupts you later:
+  - Access to Claude Desktop's data: Allow
+  - "Claude Safe Storage" in Keychain: Always Allow
+The menu bar panel shows a checklist of what's been granted. Switching the Chrome
+extension also needs Full Disk Access; the panel's Grant Access button walks you through it.
+
 Next:
-  1. Click it → "Import Current Login" and name the account you're signed in with.
+  1. Click the icon → "Import Current Login" and name the account you're signed in with.
   2. "Add Account" → Claude reopens signed out → sign in with your next account.
-  3. When macOS asks to access "Claude Safe Storage", choose "Always Allow".
 MSG

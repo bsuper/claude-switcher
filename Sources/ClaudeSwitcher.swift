@@ -27,13 +27,28 @@ enum Paths {
     static let profiles = support.appendingPathComponent("profiles")
     static let backups = support.appendingPathComponent("backups")
     static let state = support.appendingPathComponent("state.json")
-    static let handoffs = support.appendingPathComponent("handoffs")
 }
 
 let claudeBundleID = "com.anthropic.claudefordesktop"
 /// Files/dirs inside Claude's data dir that hold the signed-in account.
 let authItems = ["Cookies", "Cookies-journal", "Local Storage", "Session Storage", "IndexedDB", "WebStorage"]
 func isAuthConfigKey(_ key: String) -> Bool { key.hasPrefix("oauth:") || key == "lastKnownAccountUuid" }
+
+/// Appends one line to switcher.log so a failed switch can be diagnosed after the fact. Never logs secrets.
+var switchLogEnabled = true
+func switchLog(_ message: String) {
+    guard switchLogEnabled else { return }
+    let url = Paths.support.appendingPathComponent("switcher.log")
+    let line = "\(ISO8601DateFormatter().string(from: Date())) \(message)\n"
+    guard let data = line.data(using: .utf8) else { return }
+    if let handle = try? FileHandle(forWritingTo: url) {
+        defer { try? handle.close() }
+        _ = try? handle.seekToEnd()
+        try? handle.write(contentsOf: data)
+    } else {
+        try? data.write(to: url)
+    }
+}
 
 struct AppError: LocalizedError {
     let message: String
@@ -72,9 +87,10 @@ struct Settings: Codable, Equatable {
     var threshold: Double = 90       // 5-hour % that triggers a switch
     var weeklyThreshold: Double = 98 // 7-day % that triggers a switch
     var pollMinutes: Double = 5
-    var carryOverOnSwitch = true     // copy the outgoing account's latest chat after switching
     var shareSessions = true         // show every account's Code & Cowork sessions on all accounts
     var shareScheduledTasks = false  // off by default: copying a task restarts it on the active account
+    var switchChromeExtension = false // off by default: quits and reopens Chrome on every switch
+    var chromeProfileDir: String?
 
     init() {}
     init(from decoder: Decoder) throws {
@@ -84,9 +100,10 @@ struct Settings: Codable, Equatable {
         threshold = try c.decodeIfPresent(Double.self, forKey: .threshold) ?? d.threshold
         weeklyThreshold = try c.decodeIfPresent(Double.self, forKey: .weeklyThreshold) ?? d.weeklyThreshold
         pollMinutes = try c.decodeIfPresent(Double.self, forKey: .pollMinutes) ?? d.pollMinutes
-        carryOverOnSwitch = try c.decodeIfPresent(Bool.self, forKey: .carryOverOnSwitch) ?? d.carryOverOnSwitch
         shareSessions = try c.decodeIfPresent(Bool.self, forKey: .shareSessions) ?? d.shareSessions
         shareScheduledTasks = try c.decodeIfPresent(Bool.self, forKey: .shareScheduledTasks) ?? d.shareScheduledTasks
+        switchChromeExtension = try c.decodeIfPresent(Bool.self, forKey: .switchChromeExtension) ?? d.switchChromeExtension
+        chromeProfileDir = try c.decodeIfPresent(String.self, forKey: .chromeProfileDir)
     }
 }
 
@@ -279,49 +296,6 @@ enum UsageClient {
         }
         return FetchResult(usage: Usage(fiveHour: fh, fiveHourResets: fhr, sevenDay: sd, sevenDayResets: sdr, fetchedAt: Date()),
                            orgId: org!, email: email)
-    }
-}
-
-// MARK: - Chats (claude.ai conversations live server-side, per account)
-
-struct ChatSummary: Codable, Identifiable, Equatable {
-    var id: String
-    var name: String
-    var updatedAt: Date?
-}
-
-enum ChatClient {
-    static func recent(cookiesDB: URL, org: String, limit: Int = 10) async throws -> [ChatSummary] {
-        let (sk, _) = try UsageClient.login(cookiesDB: cookiesDB)
-        guard let list = try await UsageClient.get("/api/organizations/\(org)/chat_conversations?limit=\(limit)",
-                                                   sessionKey: sk) as? [[String: Any]] else { return [] }
-        return list.compactMap { c in
-            guard let id = c["uuid"] as? String else { return nil }
-            let name = (c["name"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "Untitled chat"
-            return ChatSummary(id: id, name: name, updatedAt: (c["updated_at"] as? String).flatMap(parseISODate))
-        }
-        .sorted { ($0.updatedAt ?? .distantPast) > ($1.updatedAt ?? .distantPast) }
-    }
-
-    /// Full text of one conversation (current branch) as Markdown.
-    static func transcript(cookiesDB: URL, org: String, chat: ChatSummary) async throws -> String {
-        let (sk, _) = try UsageClient.login(cookiesDB: cookiesDB)
-        let path = "/api/organizations/\(org)/chat_conversations/\(chat.id)?tree=False&rendering_mode=messages"
-        guard let convo = try await UsageClient.get(path, sessionKey: sk) as? [String: Any],
-              let messages = convo["chat_messages"] as? [[String: Any]] else {
-            throw AppError("Couldn’t read that conversation")
-        }
-        var out = "# \(chat.name)\n\n"
-        for m in messages {
-            var text = (m["content"] as? [[String: Any]])?
-                .filter { $0["type"] as? String == "text" }
-                .compactMap { $0["text"] as? String }
-                .joined(separator: "\n\n") ?? ""
-            if text.isEmpty { text = m["text"] as? String ?? "" }
-            guard !text.isEmpty else { continue }
-            out += (m["sender"] as? String == "human" ? "## User\n\n" : "## Claude\n\n") + text + "\n\n"
-        }
-        return out
     }
 }
 
@@ -660,6 +634,319 @@ enum SessionSync {
     }
 }
 
+// MARK: - Claude in Chrome login
+//
+// The extension's tokens are memory-only, so they don't survive a Chrome restart. On startup it signs back in
+// silently using the accountUuid and tokenOrg in chrome.storage.local (one LevelDB folder per Chrome profile) and
+// Chrome's own claude.ai login, and fails if those two disagree. So both are swapped together while Chrome is
+// closed. The cookies stay encrypted throughout: they are moved within one Chrome profile and never decrypted.
+// Shortcuts and tasks saved in the extension live in the same folder, so they switch along with it.
+
+enum ChromeExtension {
+    static let id = "fcoeoabgfenejglbffodgkkbkcdhcgfn"
+    static let bundleID = "com.google.Chrome"
+    static let dataDir = Paths.home.appendingPathComponent("Library/Application Support/Google/Chrome")
+    static let fm = FileManager.default
+
+    static var running: [NSRunningApplication] { NSRunningApplication.runningApplications(withBundleIdentifier: bundleID) }
+
+    static func storage(_ profile: String, chromeDir: URL) -> URL {
+        chromeDir.appendingPathComponent(profile).appendingPathComponent("Local Extension Settings").appendingPathComponent(id)
+    }
+
+    /// Chrome profiles with the extension installed, as (folder, display name).
+    static func profiles(chromeDir: URL = dataDir) -> [(dir: String, name: String)] {
+        guard let data = try? Data(contentsOf: chromeDir.appendingPathComponent("Local State")),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let cache = (json["profile"] as? [String: Any])?["info_cache"] as? [String: [String: Any]] else { return [] }
+        return cache.keys.sorted()
+            .filter { fm.fileExists(atPath: chromeDir.appendingPathComponent($0).appendingPathComponent("Extensions").appendingPathComponent(id).path) }
+            .map { ($0, cache[$0]?["name"] as? String ?? $0) }
+    }
+
+    /// Chrome's last used profile if it has the extension, else the first that does.
+    static func suggestedProfile(chromeDir: URL = dataDir) -> String? {
+        let all = profiles(chromeDir: chromeDir).map(\.dir)
+        let local = (try? Data(contentsOf: chromeDir.appendingPathComponent("Local State"))).flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any]
+        if let last = (local?["profile"] as? [String: Any])?["last_used"] as? String, all.contains(last) { return last }
+        return all.first
+    }
+
+    /// Moves Chrome's claude.ai cookies: saves the live rows to `saveTo`, then replaces them with `restoreFrom`'s
+    /// (none = signed out of claude.ai). The replace is one transaction, so a failure leaves the cookies as they were.
+    /// With `replace` false the live cookies are only copied, never changed.
+    static func swapCookies(db path: URL, saveTo: URL?, restoreFrom: URL?, replace: Bool = true) throws {
+        guard fm.fileExists(atPath: path.path) else { return }
+        var db: OpaquePointer?
+        // CREATE is for the ATTACHed snapshot file, which inherits these flags; the live DB is known to exist.
+        guard sqlite3_open_v2(path.path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil) == SQLITE_OK else { throw AppError("Couldn’t open Chrome’s cookies") }
+        defer { sqlite3_close(db) }
+        sqlite3_busy_timeout(db, 5000)
+        func run(_ sql: String) throws {
+            guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else {
+                throw AppError("Chrome cookie swap failed: \(String(cString: sqlite3_errmsg(db)))")
+            }
+        }
+        func quoted(_ url: URL) -> String { "'" + url.path.replacingOccurrences(of: "'", with: "''") + "'" }
+        let hosts = "host_key = 'claude.ai' OR host_key LIKE '%.claude.ai'"
+        if let saveTo {
+            try fm.createDirectory(at: saveTo.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? fm.removeItem(at: saveTo)
+            try run("ATTACH \(quoted(saveTo)) AS saved")
+            try run("CREATE TABLE saved.cookies AS SELECT * FROM main.cookies WHERE \(hosts)")
+            var check: OpaquePointer?
+            var sessions = 0
+            if sqlite3_prepare_v2(db, "SELECT count(*) FROM saved.cookies WHERE name = 'sessionKey'", -1, &check, nil) == SQLITE_OK,
+               sqlite3_step(check) == SQLITE_ROW { sessions = Int(sqlite3_column_int(check, 0)) }
+            sqlite3_finalize(check)
+            switchLog("cookies: saved \(saveTo.deletingLastPathComponent().lastPathComponent.prefix(8)) hasSession=\(sessions > 0)")
+            try run("DETACH saved")
+        }
+        guard replace else { return }
+        let restore = restoreFrom.flatMap { fm.fileExists(atPath: $0.path) ? $0 : nil }
+        if let restore { try run("ATTACH \(quoted(restore)) AS target") }
+        try run("BEGIN IMMEDIATE")
+        do {
+            try run("DELETE FROM main.cookies WHERE \(hosts)")
+            if restore != nil { try run("INSERT INTO main.cookies SELECT * FROM target.cookies") }
+            try run("COMMIT")
+        } catch {
+            try? run("ROLLBACK")
+            throw error
+        }
+    }
+
+    /// Asks Chrome to quit, then falls back to SIGTERM, which Chrome also treats as a clean exit and which
+    /// restores tabs afterwards. Never force-kills, so if both fail the swap is abandoned.
+    static func quit() async throws {
+        func waitForExit(seconds: Int) async throws -> Bool {
+            for _ in 0..<(seconds * 2) {
+                try await Task.sleep(nanoseconds: 500_000_000)
+                if running.isEmpty { return true }
+            }
+            return false
+        }
+        guard !running.isEmpty else { return switchLog("chrome: not running") }
+        let accepted = running.map { $0.terminate() }
+        switchLog("chrome: terminate accepted=\(accepted)")
+        var exited = try await waitForExit(seconds: 6)
+        if !exited {
+            let pids = running.map(\.processIdentifier)
+            switchLog("chrome: still running after terminate, sending SIGTERM to \(pids)")
+            pids.forEach { kill($0, SIGTERM) }
+            exited = try await waitForExit(seconds: 12)
+        }
+        switchLog("chrome: exited=\(exited)")
+        guard exited else { throw AppError("Chrome didn’t quit, so the extension stayed on its current account.") }
+        try await Task.sleep(nanoseconds: 1_500_000_000) // let Chrome release the LevelDB lock
+    }
+
+    static func reopen() {
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else { return }
+        let config = NSWorkspace.OpenConfiguration()
+        config.arguments = ["--restore-last-session"]
+        NSWorkspace.shared.openApplication(at: url, configuration: config)
+    }
+
+    /// The Claude account the extension in this profile was last signed in to: the newest `accountUuid` value
+    /// in its storage files. Values sit unencrypted in LevelDB, and newer files and later bytes win.
+    static func liveAccount(profile: String, chromeDir: URL = dataDir) -> String? {
+        let dir = storage(profile, chromeDir: chromeDir)
+        let files = ((try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? [])
+            .filter { ["ldb", "log"].contains($0.pathExtension) }
+            // LevelDB numbers files in write order; the .log holds the newest writes.
+            .sorted { ($0.pathExtension == "log" ? 1 : 0, $0.lastPathComponent) < ($1.pathExtension == "log" ? 1 : 0, $1.lastPathComponent) }
+        let key = Data("accountUuid".utf8)
+        let uuid = try! NSRegularExpression(pattern: "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+        var latest: String?
+        for file in files {
+            guard let data = try? Data(contentsOf: file) else { continue }
+            var start = data.startIndex
+            while let r = data.range(of: key, in: start..<data.endIndex) {
+                let window = data[r.upperBound..<min(r.upperBound + 64, data.endIndex)]
+                let text = String(decoding: window, as: UTF8.self)
+                if let m = uuid.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+                   let range = Range(m.range, in: text) { latest = String(text[range]) }
+                start = r.upperBound
+            }
+        }
+        return latest
+    }
+
+    /// Saves the live login under the account it actually belongs to and restores `to`'s; an account with nothing
+    /// saved comes up signed out. `accounts` maps Claude account UUIDs to switcher account ids, so a login that
+    /// drifted out of step with Claude Desktop is never filed under the wrong account. Chrome must be closed.
+    static func swap(profile: String, from: String?, to: String, accounts: [String: String]? = nil,
+                     chromeDir: URL = dataDir, store: URL = Paths.support) throws {
+        let live = storage(profile, chromeDir: chromeDir)
+        func saved(_ account: String) -> URL {
+            store.appendingPathComponent("chrome-extension").appendingPathComponent(account).appendingPathComponent(profile)
+        }
+        let hadLogin = fm.fileExists(atPath: live.path)
+        let liveUuid = hadLogin ? liveAccount(profile: profile, chromeDir: chromeDir) : nil
+        // Without a mapping (test hook) trust `from`; with one, file the login only under its real owner.
+        let owner = accounts == nil ? from : liveUuid.flatMap { accounts?[$0] }
+        switchLog("extension: live account=\(liveUuid?.prefix(8) ?? "none") owner=\(owner?.prefix(8) ?? "none") from=\(from?.prefix(8) ?? "none") to=\(to.prefix(8))")
+        func savedCookies(_ account: String) -> URL { saved(account).appendingPathExtension("cookies.sqlite") }
+        let cookies = chromeDir.appendingPathComponent(profile).appendingPathComponent("Cookies")
+        if owner == to, hadLogin {
+            // Already signed in to the target; just remember it, cookies included.
+            try fm.createDirectory(at: saved(to).deletingLastPathComponent(), withIntermediateDirectories: true)
+            try SessionSync.clone(live, to: saved(to))
+            try swapCookies(db: cookies, saveTo: savedCookies(to), restoreFrom: nil, replace: false)
+            return
+        }
+        let backups = store.appendingPathComponent("backups-chrome")
+        let backup = backups.appendingPathComponent(ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-"))
+        // Cookies are backed up first and unconditionally: they are about to be replaced, and an unknown owner
+        // (below) means there is no account to file them under.
+        try fm.createDirectory(at: backup, withIntermediateDirectories: true)
+        try swapCookies(db: cookies, saveTo: backup.appendingPathComponent(profile).appendingPathExtension("cookies.sqlite"), restoreFrom: nil, replace: false)
+        if hadLogin {
+            try SessionSync.clone(live, to: backup.appendingPathComponent(profile))
+            let all = (try? fm.contentsOfDirectory(at: backups, includingPropertiesForKeys: nil)) ?? []
+            for old in all.sorted(by: { $0.lastPathComponent > $1.lastPathComponent }).dropFirst(3) { try? fm.removeItem(at: old) }
+        }
+        if let owner, hadLogin {
+            try fm.createDirectory(at: saved(owner).deletingLastPathComponent(), withIntermediateDirectories: true)
+            try SessionSync.clone(live, to: saved(owner))
+        }
+        try swapCookies(db: cookies, saveTo: owner.map(savedCookies), restoreFrom: savedCookies(to))
+        do {
+            if fm.fileExists(atPath: saved(to).path) {
+                try fm.createDirectory(at: live.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try SessionSync.clone(saved(to), to: live)
+            } else if hadLogin {
+                try fm.removeItem(at: live)
+            }
+        } catch {
+            if hadLogin { try? SessionSync.clone(backup.appendingPathComponent(profile), to: live) }
+            throw error
+        }
+    }
+
+    static func forget(account: String, store: URL = Paths.support) {
+        try? fm.removeItem(at: store.appendingPathComponent("chrome-extension").appendingPathComponent(account))
+    }
+}
+
+// MARK: - Permissions
+
+/// Touches everything the app needs so macOS asks for all of it during setup, not in the middle of a switch.
+/// Each check is a plain read that triggers the system prompt if access hasn't been granted yet.
+struct PermissionCheck: Identifiable, Equatable {
+    var id: String { name }
+    var name: String
+    var purpose: String
+    var problem: String?
+}
+
+enum Permissions {
+    static func check() -> [PermissionCheck] {
+        func read(_ url: URL) -> String? {
+            guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+            do {
+                _ = try Data(contentsOf: url, options: .mappedIfSafe)
+                return nil
+            } catch {
+                switchLog("permissions: can't read \(url.lastPathComponent): \(error.localizedDescription)")
+                return "macOS blocked access. Use Try Again and choose Allow, or turn on Full Disk Access for Claude Switcher."
+            }
+        }
+        var checks = [PermissionCheck(name: "Claude Desktop data", purpose: "To save and restore each account’s login",
+                                      problem: read(Paths.claudeData.appendingPathComponent("Cookies")) ?? read(Paths.claudeConfig))]
+        var keychain: String?
+        do { _ = try ChromeCrypto.key() } catch { keychain = error.localizedDescription }
+        checks.append(PermissionCheck(name: "“Claude Safe Storage” in Keychain", purpose: "To check usage on every account. Choose Always Allow.", problem: keychain))
+        if FileManager.default.fileExists(atPath: ChromeExtension.dataDir.path) {
+            let chrome = ChromeExtension.suggestedProfile().map { ChromeExtension.dataDir.appendingPathComponent($0).appendingPathComponent("Cookies") }
+            let blocked = read(ChromeExtension.dataDir.appendingPathComponent("Local State")) ?? chrome.flatMap(read)
+            checks.append(PermissionCheck(name: "Chrome data", purpose: "To switch the Claude in Chrome extension",
+                                          problem: blocked == nil ? nil : "Needs Full Disk Access. Click Grant Access and drag the app into the list."))
+        }
+        return checks
+    }
+
+    static func openSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") { NSWorkspace.shared.open(url) }
+    }
+
+}
+
+// MARK: - Full Disk Access helper
+//
+// macOS has no API to request Full Disk Access, and an app only shows up in that list once it's added. So this
+// opens the list next to a small floating window holding the app's icon to drag in, then watches for the grant
+// and closes itself once Chrome's data is readable.
+
+enum AccessHelper {
+    private static var panel: NSPanel?
+    private static var timer: Timer?
+
+    static var chromeReadable: Bool {
+        (try? Data(contentsOf: ChromeExtension.dataDir.appendingPathComponent("Local State"))) != nil
+    }
+
+    @MainActor static func show(model: AppModel) {
+        Permissions.openSettings()
+        if panel == nil {
+            let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 300, height: 290),
+                            styleMask: [.titled, .closable, .utilityWindow, .nonactivatingPanel],
+                            backing: .buffered, defer: false)
+            p.title = "Give Full Disk Access"
+            p.level = .floating
+            p.isReleasedWhenClosed = false
+            p.hidesOnDeactivate = false
+            p.contentView = NSHostingView(rootView: AccessHelperView())
+            panel = p
+        }
+        if let visible = (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame, let p = panel {
+            p.setFrameTopLeftPoint(NSPoint(x: visible.maxX - p.frame.width - 24, y: visible.maxY - 24))
+        }
+        panel?.orderFrontRegardless()
+        switchLog("permissions: showing Full Disk Access helper")
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { _ in
+            guard chromeReadable else { return }
+            timer?.invalidate()
+            timer = nil
+            panel?.close()
+            switchLog("permissions: Chrome data readable")
+            Task { @MainActor in await model.checkPermissions() }
+        }
+    }
+}
+
+struct AccessHelperView: View {
+    var body: some View {
+        VStack(spacing: 12) {
+            Text("Drag this icon into the Full Disk Access list")
+                .font(.system(size: 13, weight: .semibold)).multilineTextAlignment(.center)
+            VStack(spacing: 4) {
+                Image(nsImage: NSWorkspace.shared.icon(forFile: Bundle.main.bundlePath))
+                    .resizable().frame(width: 64, height: 64)
+                Text("ClaudeSwitcher").font(.system(size: 11, weight: .medium))
+            }
+            .padding(10)
+            .background(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Color.claude.opacity(0.6), style: StrokeStyle(lineWidth: 1.5, dash: [5, 4])))
+            .onDrag { NSItemProvider(object: Bundle.main.bundleURL as NSURL) }
+            .help("Drag into System Settings → Full Disk Access")
+            VStack(alignment: .leading, spacing: 4) {
+                Text("1. Drop it on the list in System Settings")
+                Text("2. Confirm with Touch ID or your password")
+                Text("3. Make sure its switch is on")
+            }
+            .font(.system(size: 11)).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
+            Text("This window closes by itself once access works.")
+                .font(.system(size: 10)).foregroundStyle(.tertiary)
+            Button("Show in Finder Instead") { NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL]) }
+                .buttonStyle(.link).font(.system(size: 11))
+        }
+        .padding(16)
+        .frame(width: 300)
+    }
+}
+
 // MARK: - App model
 
 @MainActor
@@ -667,8 +954,10 @@ final class AppModel: ObservableObject {
     @Published var state: AppState { didSet { if state != oldValue && !isDemo { save() } } }
     @Published var busy: String?
     @Published var lastRefresh: Date?
-    @Published var chats: [UUID: [ChatSummary]] = [:]
     @Published var lastSessionSync: String?
+    @Published var permissions: [PermissionCheck] = []
+    private var pendingAlert: String?
+    private var restartChrome = true
     var isSnapshot = false
     @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
 
@@ -687,7 +976,19 @@ final class AppModel: ObservableObject {
         timer = Timer.scheduledTimer(withTimeInterval: max(1, state.settings.pollMinutes) * 60, repeats: true) { [weak self] _ in
             Task { await self?.refreshAll() }
         }
-        Task { await refreshAll() }
+        reconcileActiveAccount()
+        Task {
+            await checkPermissions()
+            if state.settings.switchChromeExtension, permissions.contains(where: { $0.name == "Chrome data" && $0.problem != nil }) {
+                AccessHelper.show(model: self)
+            }
+            await refreshAll()
+        }
+    }
+
+    /// Runs off the main thread: each check can block on a system prompt until it's answered.
+    func checkPermissions() async {
+        permissions = await Task.detached { Permissions.check() }.value
     }
 
     var active: Profile? { state.profiles.first { $0.id == state.activeId } }
@@ -703,12 +1004,12 @@ final class AppModel: ObservableObject {
         let side = Profile(name: "Side Project", email: "alex.builds@example.com", usage: usage(3, 4.9, 27, 130))
         isDemo = true
         state = AppState(profiles: [work, personal, side], activeId: work.id, settings: state.settings)
-        chats[personal.id] = [
-            ChatSummary(id: "1", name: "Trip itinerary for Lisbon", updatedAt: now - 3600),
-            ChatSummary(id: "2", name: "Refactor auth middleware", updatedAt: now - 5 * 3600),
-            ChatSummary(id: "3", name: "Quarterly planning notes", updatedAt: now - 26 * 3600),
-        ]
-        chats[side.id] = [ChatSummary(id: "4", name: "Landing page copy", updatedAt: now - 2 * 3600)]
+    }
+
+    /// Empty first-run state for screenshots. Never saved.
+    func isDemoOnly() {
+        isDemo = true
+        state = AppState()
     }
 
     /// Demo data is never written to disk.
@@ -730,6 +1031,7 @@ final class AppModel: ObservableObject {
 
     func refreshAll() async {
         guard !refreshing else { return }
+        if busy == nil { reconcileActiveAccount() }
         refreshing = true
         defer { refreshing = false }
         let history = UsageHistory.latestByOrg()
@@ -745,9 +1047,6 @@ final class AppModel: ObservableObject {
                 state.profiles[i].orgId = r.orgId
                 if let e = r.email { state.profiles[i].email = e }
                 state.profiles[i].lastError = nil
-                if let list = try? await Task.detached(operation: { try await ChatClient.recent(cookiesDB: db, org: r.orgId) }).value {
-                    chats[p.id] = list
-                }
             case .failure(let e):
                 state.profiles[i].lastError = e.localizedDescription
                 if let org = state.profiles[i].orgId, let cached = history[org],
@@ -797,62 +1096,29 @@ final class AppModel: ObservableObject {
 
     func switchTo(_ id: UUID) async {
         guard busy == nil, id != state.activeId, let target = state.profiles.first(where: { $0.id == id }) else { return }
-        let outgoing = active
-        let latest = outgoing.flatMap { chats[$0.id]?.first }
-        let ok = await perform("Switching to \(target.name)…") {
-            try await self.swapLogin(to: self.profileDir(id), org: target.orgId)
+        reconcileActiveAccount()
+        // A switch you just made shouldn't be undone by auto-switch, even onto an account near its limit.
+        lastAutoPrompt = Date()
+        switchLog("switch: to \(id.uuidString.prefix(8))")
+        await perform("Switching to \(target.name)…") {
+            try await self.swapLogin(to: self.profileDir(id), org: target.orgId, target: id, name: target.name)
             self.state.activeId = id
-        }
-        if ok, state.settings.carryOverOnSwitch, let outgoing, let latest {
-            await carryOver(from: outgoing.id, chat: latest, afterSwitch: true)
-        }
-    }
-
-    /// Copies a chat from any saved account so it can be continued on the active one:
-    /// writes a Markdown transcript to handoffs/ and puts a ready-to-paste prompt on the clipboard.
-    func carryOver(from profileId: UUID, chat: ChatSummary, afterSwitch: Bool = false) async {
-        guard let p = state.profiles.first(where: { $0.id == profileId }), let org = p.orgId else { return }
-        let db = (p.id == state.activeId ? Paths.claudeData : profileDir(p.id)).appendingPathComponent("Cookies")
-        do {
-            let md = try await Task.detached { try await ChatClient.transcript(cookiesDB: db, org: org, chat: chat) }.value
-            try FileManager.default.createDirectory(at: Paths.handoffs, withIntermediateDirectories: true)
-            let safe = chat.name.replacingOccurrences(of: #"[/:\\]"#, with: "-", options: .regularExpression).prefix(60)
-            let file = Paths.handoffs.appendingPathComponent("\(safe) (\(p.name)).md")
-            try md.write(to: file, atomically: true, encoding: .utf8)
-
-            let prompt = "I'm continuing a conversation I started on another account. Here is the full transcript so far — pick up where it left off.\n\n<previous_conversation>\n\(md)</previous_conversation>"
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(prompt, forType: .string)
-
-            NSApp.activate(ignoringOtherApps: true)
-            let a = NSAlert()
-            a.messageText = afterSwitch ? "Switched — “\(chat.name)” is ready to continue" : "“\(chat.name)” copied"
-            a.informativeText = "The transcript from \(p.name) is on your clipboard. Start a new chat in Claude and paste (⌘V). It’s also saved as a file you can attach instead."
-            a.addButton(withTitle: "Open Claude")
-            a.addButton(withTitle: "Show File")
-            a.addButton(withTitle: "Done")
-            switch a.runModal() {
-            case .alertFirstButtonReturn: ClaudeDesktop.launch()
-            case .alertSecondButtonReturn: NSWorkspace.shared.activateFileViewerSelecting([file])
-            default: break
-            }
-        } catch {
-            alert("Couldn’t copy “\(chat.name)”", error.localizedDescription)
         }
     }
 
     func addAccount(name: String) async {
         guard busy == nil else { return }
         await perform("Signing out for new account…") {
-            try await self.swapLogin(to: nil, org: nil)
             let p = Profile(name: name)
+            try await self.swapLogin(to: nil, org: nil, target: p.id, name: name)
             self.state.profiles.append(p)
             self.state.activeId = p.id
         }
     }
 
     /// Quit Claude, save the active login, restore `dir` (nil = signed out), relaunch.
-    private func swapLogin(to dir: URL?, org: String?) async throws {
+    private func swapLogin(to dir: URL?, org: String?, target: UUID, name: String) async throws {
+        restartChrome = confirmChromeRestart(name: name)
         try await ClaudeDesktop.quit()
         let backup = try Snapshot.backup()
         do {
@@ -864,8 +1130,84 @@ final class AppModel: ObservableObject {
             throw error
         }
         if state.settings.shareSessions { await syncSessions(org: org) }
+        pendingAlert = await swapChromeExtension(to: target)
         ClaudeDesktop.launch()
     }
+
+    /// Makes the active account match who Claude Desktop is really signed in as, so a login can never be
+    /// captured under the wrong account (after a crash, a quit mid-switch, or signing in by hand).
+    func reconcileActiveAccount() {
+        guard let live = (try? Snapshot.readConfig())?["lastKnownAccountUuid"] as? String else { return }
+        for p in state.profiles where p.id != state.activeId {
+            let url = profileDir(p.id).appendingPathComponent("auth-config.json")
+            let config = (try? Data(contentsOf: url)).flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any]
+            if config?["lastKnownAccountUuid"] as? String == live {
+                switchLog("reconcile: Claude Desktop is on \(p.id.uuidString.prefix(8)), was marked \(state.activeId?.uuidString.prefix(8) ?? "none")")
+                state.activeId = p.id
+                return
+            }
+        }
+    }
+
+    /// Asks before anything quits, so Chrome closing is never a surprise. Also pauses an automatic switch until
+    /// answered, because closing Chrome unattended could lose work. Returns false to leave Chrome alone.
+    private func confirmChromeRestart(name: String) -> Bool {
+        guard state.settings.switchChromeExtension, !ChromeExtension.running.isEmpty else { return true }
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert()
+        a.messageText = "Restart Chrome to switch to “\(name)”?"
+        a.informativeText = "Chrome has to restart so the Claude extension can load this account. It closes and reopens by itself with your tabs restored. Save anything you’re working on in Chrome first."
+        a.addButton(withTitle: "Restart Chrome")
+        a.addButton(withTitle: "Keep Chrome Open")
+        let ok = a.runModal() == .alertFirstButtonReturn
+        switchLog("extension: restart Chrome answered \(ok)")
+        return ok
+    }
+
+    /// Never blocks a switch: returns what went wrong, if anything, so Claude still ends up on the new account.
+    private func swapChromeExtension(to target: UUID) async -> String? {
+        guard state.settings.switchChromeExtension else { switchLog("extension: toggle off"); return nil }
+        guard restartChrome else { return "Chrome stayed open, so the Claude extension is still on its previous account. Switch again to restart it." }
+        guard let profile = state.settings.chromeProfileDir ?? ChromeExtension.suggestedProfile() else {
+            let blocked = FileManager.default.fileExists(atPath: ChromeExtension.dataDir.path)
+                && (try? Data(contentsOf: ChromeExtension.dataDir.appendingPathComponent("Local State"))) == nil
+            switchLog("extension: no profile found, macOS blocking Chrome data=\(blocked)")
+            return blocked ? "Claude Switcher needs Full Disk Access to switch the Chrome extension. Open the panel and click Grant Access."
+                           : "No Chrome profile with the Claude extension was found."
+        }
+        busy = "Switching Chrome extension…"
+        let wasRunning = !ChromeExtension.running.isEmpty
+        switchLog("extension: profile=\(profile) chromeRunning=\(wasRunning)")
+        do {
+            try await ChromeExtension.quit()
+        } catch {
+            switchLog("extension: \(error.localizedDescription)")
+            return error.localizedDescription
+        }
+        defer { if wasRunning { ChromeExtension.reopen() } }
+        let from = state.activeId?.uuidString
+        do {
+            try ChromeExtension.swap(profile: profile, from: from, to: target.uuidString, accounts: claudeAccounts())
+            switchLog("extension: swapped")
+            return nil
+        } catch {
+            switchLog("extension: swap failed: \(error.localizedDescription)")
+            return error.localizedDescription
+        }
+    }
+
+    /// Claude account UUID → switcher account id, from each account's saved login. Never from Claude Desktop's live
+    /// config: mid-switch that already holds the target account, while the outgoing one was just saved.
+    private func claudeAccounts() -> [String: String] {
+        var map: [String: String] = [:]
+        for p in state.profiles {
+            let url = profileDir(p.id).appendingPathComponent("auth-config.json")
+            let config = (try? Data(contentsOf: url)).flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any]
+            if let uuid = config?["lastKnownAccountUuid"] as? String { map[uuid] = p.id.uuidString }
+        }
+        return map
+    }
+
 
     /// Syncs without switching, e.g. to bring sessions to an account that just signed in for the first time.
     func promptSyncNow() {
@@ -904,6 +1246,11 @@ final class AppModel: ObservableObject {
         do {
             try await work()
             busy = nil
+            // Shown only after the caller's work, so the new active account is already saved.
+            if let message = pendingAlert {
+                pendingAlert = nil
+                alert("Chrome extension not switched", message)
+            }
             try? await Task.sleep(nanoseconds: 4_000_000_000)
             await refreshAll()
             return true
@@ -917,6 +1264,7 @@ final class AppModel: ObservableObject {
     func remove(_ id: UUID) {
         guard id != state.activeId else { return }
         try? FileManager.default.removeItem(at: profileDir(id))
+        ChromeExtension.forget(account: id.uuidString)
         state.profiles.removeAll { $0.id == id }
     }
 
@@ -1147,40 +1495,10 @@ struct IconButton: View {
     }
 }
 
-struct ChatRow: View {
-    let chat: ChatSummary
-    let actionLabel: String
-    let action: () -> Void
-    @State private var hovering = false
-
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 8) {
-                Image(systemName: "bubble.left").font(.system(size: 10)).foregroundStyle(.tertiary)
-                Text(chat.name).font(.system(size: 11.5)).lineLimit(1).truncationMode(.tail)
-                Spacer(minLength: 6)
-                if hovering {
-                    Text(actionLabel).font(.system(size: 10.5, weight: .semibold)).foregroundStyle(Color.claude)
-                } else if let d = chat.updatedAt {
-                    Text(d.formatted(.relative(presentation: .numeric, unitsStyle: .abbreviated)))
-                        .font(.system(size: 10)).foregroundStyle(.tertiary)
-                }
-            }
-            .padding(.horizontal, 8).padding(.vertical, 5)
-            .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.primary.opacity(hovering ? 0.07 : 0)))
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .onHover { hovering = $0 }
-        .help("Copy this chat’s transcript to continue it on the active account")
-    }
-}
-
 struct AccountCard: View {
     @EnvironmentObject var model: AppModel
     let profile: Profile
     @State private var hovering = false
-    @State private var showChats = false
     var isActive: Bool { model.state.activeId == profile.id }
 
     var body: some View {
@@ -1248,38 +1566,6 @@ struct AccountCard: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            if let list = model.chats[profile.id], !list.isEmpty {
-                VStack(alignment: .leading, spacing: 2) {
-                    Button {
-                        showChats.toggle()
-                    } label: {
-                        HStack(spacing: 5) {
-                            Image(systemName: "chevron.right")
-                                .font(.system(size: 8.5, weight: .bold))
-                                .rotationEffect(.degrees(showChats ? 90 : 0))
-                                .animation(.easeInOut(duration: 0.15), value: showChats)
-                            Text("Recent chats")
-                            Text("\(list.count)").foregroundStyle(.tertiary)
-                            Spacer()
-                        }
-                        .font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-
-                    if showChats {
-                        VStack(spacing: 0) {
-                            ForEach(list) { chat in
-                                ChatRow(chat: chat, actionLabel: isActive ? "Copy" : "Continue here") {
-                                    Task { await model.carryOver(from: profile.id, chat: chat) }
-                                }
-                            }
-                        }
-                        .padding(.top, 3)
-                    }
-                }
-                .padding(.top, 1)
-            }
         }
         .padding(12)
         .background(
@@ -1333,9 +1619,6 @@ struct SettingsPanel: View {
                 }
             }
             .disabled(model.state.settings.mode == .off)
-            SettingRow(title: "Bring latest chat along", subtitle: "Copy it to the clipboard after switching") {
-                Toggle("", isOn: $model.state.settings.carryOverOnSwitch).toggleStyle(.switch).controlSize(.mini).labelsHidden()
-            }
             SettingRow(title: "Share Code & Cowork sessions", subtitle: "Every account sees the same sidebar") {
                 Toggle("", isOn: $model.state.settings.shareSessions).toggleStyle(.switch).controlSize(.mini).labelsHidden()
             }
@@ -1343,6 +1626,24 @@ struct SettingsPanel: View {
                 Toggle("", isOn: $model.state.settings.shareScheduledTasks).toggleStyle(.switch).controlSize(.mini).labelsHidden()
             }
             .disabled(!model.state.settings.shareSessions)
+            SettingRow(title: "Switch Chrome extension too", subtitle: "Quits and reopens Chrome on every switch") {
+                Toggle("", isOn: Binding(get: { model.state.settings.switchChromeExtension }, set: { on in
+                    if on && model.state.settings.chromeProfileDir == nil {
+                        model.state.settings.chromeProfileDir = ChromeExtension.suggestedProfile()
+                    }
+                    model.state.settings.switchChromeExtension = on
+                    if on && !AccessHelper.chromeReadable { AccessHelper.show(model: model) }
+                })).toggleStyle(.switch).controlSize(.mini).labelsHidden()
+            }
+            if model.state.settings.switchChromeExtension {
+                SettingRow(title: "Chrome profile") {
+                    Picker("", selection: Binding(get: { model.state.settings.chromeProfileDir ?? ChromeExtension.suggestedProfile() ?? "" },
+                                                  set: { model.state.settings.chromeProfileDir = $0 })) {
+                        ForEach(ChromeExtension.profiles(), id: \.dir) { Text($0.name).tag($0.dir) }
+                    }
+                    .labelsHidden().fixedSize()
+                }
+            }
             SettingRow(title: "Sync sessions", subtitle: "Without switching accounts") {
                 Button("Sync Now") { model.promptSyncNow() }
                     .buttonStyle(PillButtonStyle(prominent: false))
@@ -1354,6 +1655,41 @@ struct SettingsPanel: View {
             }
         }
         .padding(12)
+        .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.primary.opacity(0.025)))
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Color.primary.opacity(0.07), lineWidth: 1))
+    }
+}
+
+/// Shown during setup, and afterwards whenever something isn't granted.
+struct PermissionsCard: View {
+    @EnvironmentObject var model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            Text("Permissions").font(.system(size: 12, weight: .semibold))
+            ForEach(model.permissions) { check in
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: check.problem == nil ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                        .font(.system(size: 12)).foregroundStyle(check.problem == nil ? Color.green : Color.orange)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(check.name).font(.system(size: 12))
+                        Text(check.problem ?? check.purpose).font(.system(size: 10)).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+            if model.permissions.contains(where: { $0.problem != nil }) {
+                HStack(spacing: 6) {
+                    if model.permissions.contains(where: { $0.name == "Chrome data" && $0.problem != nil }) {
+                        Button("Grant Access") { AccessHelper.show(model: model) }.buttonStyle(PillButtonStyle())
+                    }
+                    Button("Try Again") { Task { await model.checkPermissions() } }
+                        .buttonStyle(PillButtonStyle(prominent: !model.permissions.contains { $0.name == "Chrome data" && $0.problem != nil }))
+                }
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.primary.opacity(0.025)))
         .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Color.primary.opacity(0.07), lineWidth: 1))
     }
@@ -1408,6 +1744,10 @@ struct MenuContent: View {
                 }
             }
             .padding(.horizontal, 2)
+
+            if !model.permissions.isEmpty && (model.state.profiles.isEmpty || model.permissions.contains { $0.problem != nil }) {
+                PermissionsCard()
+            }
 
             if model.state.profiles.isEmpty {
                 EmptyState()
@@ -1478,6 +1818,35 @@ struct MenuBarLabel: View {
 enum Entry {
     static func main() {
         if CommandLine.arguments.contains("--probe") { probe(); return }
+        if CommandLine.arguments.contains("--restart-chrome") {
+            // Test hook: quits and reopens Chrome the way a switch does, without touching any login.
+            Task.detached {
+                do { try await ChromeExtension.quit(); print("chrome quit ok") } catch { print("error: \(error.localizedDescription)") }
+                ChromeExtension.reopen()
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                exit(0)
+            }
+            RunLoop.main.run()
+            return
+        }
+        if CommandLine.arguments.contains("--chrome-profiles") {
+            print("with extension: \(ChromeExtension.profiles().map(\.dir)); suggested: \(ChromeExtension.suggestedProfile() ?? "none")")
+            return
+        }
+        if let i = CommandLine.arguments.firstIndex(of: "--swap-extension"), i + 5 < CommandLine.arguments.count {
+            // Test hook: --swap-extension <chrome-dir> <store-dir> <profile> <from-account> <to-account>
+            switchLogEnabled = false
+            let a = Array(CommandLine.arguments[(i + 1)...])
+            let chrome = URL(fileURLWithPath: a[0])
+            do {
+                // Optional 6th argument: uuid=account,uuid=account maps Claude accounts, as a real switch does.
+                let accounts = a.count > 5 ? Dictionary(uniqueKeysWithValues: a[5].split(separator: ",").map { pair -> (String, String) in
+                    let kv = pair.split(separator: "="); return (String(kv[0]), String(kv[1])) }) : nil
+                try ChromeExtension.swap(profile: a[2], from: a[3], to: a[4], accounts: accounts, chromeDir: chrome, store: URL(fileURLWithPath: a[1]))
+                print("swapped; suggested profile: \(ChromeExtension.suggestedProfile(chromeDir: chrome) ?? "none")")
+            } catch { print("error: \(error.localizedDescription)") }
+            return
+        }
         if let i = CommandLine.arguments.firstIndex(of: "--sync-sessions"), i + 2 < CommandLine.arguments.count {
             // Test hook: --sync-sessions <claude-data-dir> <store-dir>
             let base = URL(fileURLWithPath: CommandLine.arguments[i + 1]), store = URL(fileURLWithPath: CommandLine.arguments[i + 2])
@@ -1500,11 +1869,22 @@ enum Entry {
             model.isSnapshot = true
             model.lastRefresh = Date()
             if CommandLine.arguments.contains("--demo") { model.loadDemo() }
+            if CommandLine.arguments.contains("--setup-demo") {
+                model.isDemoOnly()
+                model.permissions = [
+                    PermissionCheck(name: "Claude Desktop data", purpose: "To save and restore each account’s login"),
+                    PermissionCheck(name: "“Claude Safe Storage” in Keychain", purpose: "To check usage on every account. Choose Always Allow."),
+                    PermissionCheck(name: "Chrome data", purpose: "To switch the Claude in Chrome extension",
+                                    problem: "macOS blocked access. Allow Claude Switcher under Privacy & Security, then try again."),
+                ]
+            }
             let view = MenuContent()
                 .environmentObject(model)
                 .background(Color(nsColor: .windowBackgroundColor))
                 .environment(\.colorScheme, CommandLine.arguments.contains("--dark") ? .dark : .light)
-            let r = ImageRenderer(content: view)
+            let r = CommandLine.arguments.contains("--helper")
+                ? ImageRenderer(content: AnyView(AccessHelperView().background(Color(nsColor: .windowBackgroundColor))))
+                : ImageRenderer(content: AnyView(view))
             r.scale = 2
             if let img = r.nsImage, let tiff = img.tiffRepresentation,
                let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) {
@@ -1524,13 +1904,6 @@ enum Entry {
                 print("account: \(r.email ?? "?")  org: \(r.orgId)")
                 print("5h: \(r.usage.fiveHour.map { String(format: "%.0f%%", $0) } ?? "n/a")  \(resetText(r.usage.fiveHourResets))")
                 print("7d: \(r.usage.sevenDay.map { String(format: "%.0f%%", $0) } ?? "n/a")  \(resetText(r.usage.sevenDayResets))")
-                let db = Paths.claudeData.appendingPathComponent("Cookies")
-                let chats = try await ChatClient.recent(cookiesDB: db, org: r.orgId, limit: 5)
-                print("recent chats: \(chats.count)")
-                if let first = chats.first {
-                    let md = try await ChatClient.transcript(cookiesDB: db, org: r.orgId, chat: first)
-                    print("latest transcript: \(md.components(separatedBy: "\n## ").count - 1) messages, \(md.count) chars")
-                }
             } catch {
                 print("error: \(error.localizedDescription)")
             }

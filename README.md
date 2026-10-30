@@ -12,7 +12,6 @@ A macOS menu bar app for people with more than one Claude account. It tracks eve
 - **One-click switching.** Claude quits, the switcher swaps the saved login, Claude reopens on the other account (~5 seconds).
 - **Auto-switch.** When the active account passes a threshold (default 90% of the 5-hour limit), it asks — or just switches — to the account with the most room.
 - **Your sidebar follows you.** Claude Code and Cowork sessions are shared across all accounts.
-- **Chats come along.** Continue any recent chat from another account on the one you're using.
 
 > Not affiliated with or endorsed by Anthropic. It works with Claude Desktop's local files and claude.ai's internal endpoints, which can change without notice.
 
@@ -32,11 +31,18 @@ cd claude-switcher
 
 This builds the app from source (about a minute), installs it to `~/Applications`, and launches it. Because it's built on your own Mac, there's no Gatekeeper warning.
 
+On first launch the app asks for every permission it needs, one after another, so nothing interrupts you later. The panel shows a checklist of what's been granted. Builds are signed with a stable local identity (created once, in its own keychain file), so permissions survive `git pull && ./install.sh`.
+
+| Permission | Why |
+|---|---|
+| Claude Desktop's data | Save and restore each account's login |
+| **"Claude Safe Storage"** in Keychain (choose **Always Allow**) | Read each account's session to check usage |
+| **Full Disk Access**, if you use the Chrome extension switch | Read and swap the extension's data in Chrome's folder. macOS has no prompt for this, so **Grant Access** opens the list beside a small window: drag the app's icon in and turn it on. The window closes itself once access works. |
+
 Then, from the ring icon in the menu bar:
 
 1. **Import Current Login** — name the account Claude Desktop is signed into right now.
 2. **Add Account** — Claude reopens signed out; sign in with your next account. Repeat for each account.
-3. When macOS asks to let Claude Switcher access **"Claude Safe Storage"**, choose **Always Allow**. That's how it reads each account's session to check usage. (Rebuilding the app asks again.)
 
 To start it automatically, open the gear menu and turn on **Launch at login**.
 
@@ -48,13 +54,11 @@ To start it automatically, open the gear menu and turn on **Launch at login**.
 |---|---|
 | **Switch** | Moves Claude Desktop to that account. Anything running in Claude is interrupted, so you're asked first. |
 | **Auto-switch** (gear menu) | *Off*, *Ask* (a dialog when you hit the threshold), or *Auto*. Only switches if another account is at least 10 points below the threshold; waits 20 minutes between prompts. |
-| **Recent chats** | Each account lists its latest chats. **Continue here** copies the full transcript as a ready-to-paste prompt and saves a `.md` file you can attach. |
-| **Bring latest chat along** | After every switch, the outgoing account's most recent chat is put on your clipboard — start a new chat and ⌘V. |
 | **Share Code & Cowork sessions** | Every account sees the same Code and Cowork sidebar (details below). |
 
-### Why chats are copied but sessions are shared
+### Shared sessions
 
-**Chat** conversations live on Anthropic's servers, per account. Another account can't open them, so the switcher hands you the transcript to continue from.
+Chat conversations live on Anthropic's servers, per account, so they stay with the account they were started on.
 
 **Code and Cowork** sessions live on your Mac, but Claude Desktop files them per account (`claude-code-sessions/<account>/<org>/`, same for `local-agent-mode-sessions`) and only shows the active account's folder. On every switch, while Claude is closed, the switcher merges them:
 
@@ -67,6 +71,17 @@ To start it automatically, open the gear menu and turn on **Launch at login**.
 - A brand-new account gets the shared sessions from **Sync Now** in the gear menu, or on the next switch. Both restart Claude.
 
 **Where did my sessions go?** Claude Desktop's *Archive inactive sessions* setting (Settings → Claude Code) also applies to shared sessions, so older ones land under Archived rather than in the main sidebar. They aren't lost; set it to never if you want them all visible.
+
+### Claude in Chrome
+
+Turn on **Switch Chrome extension too** in the gear menu and pick the Chrome profile, and the extension follows your account switches. It's off by default because **Chrome has to restart on every switch**. You're asked first, even on automatic switches, and the switch waits for your answer. Chrome reopens by itself with your tabs restored, but anything unsaved in a page can be lost. If you keep Chrome open, Claude Desktop still switches and the extension stays on its previous account. If Chrome still won't close, Claude switches anyway and the extension stays where it was.
+
+The extension's tokens only live in memory, so after every Chrome restart it signs back in silently using its saved account and Chrome's own claude.ai login. Those two have to match, so the switcher swaps both while Chrome is closed:
+
+- **claude.ai in that Chrome profile switches accounts too.** Its cookies are moved as they are and never decrypted.
+- The first switch to each account comes up signed out, on both claude.ai and the extension. Sign in to both once and it's remembered.
+- Shortcuts and tasks saved in the extension belong to the account they were made on and switch with it.
+- This relies on undocumented extension behavior and can break when the extension updates.
 
 ## How it works
 
@@ -84,8 +99,10 @@ Everything stays on your Mac, in `~/Library/Application Support/ClaudeSwitcher/`
 | `backups/` | Login backup before each switch (last 5) |
 | `backups-sessions/` | Session folders before each sync (last 3, APFS clones) |
 | `session-trash/` | Sessions deleted on one account and removed from the others |
-| `handoffs/` | Chat transcripts you carried over |
+| `chrome-extension/` | Saved extension data and Chrome's claude.ai cookies, per account |
+| `backups-chrome/` | Extension storage before each switch (last 3) |
 | `state.json` | Accounts, last known usage, settings |
+| `switcher.log` | Each switch step, for troubleshooting (no secrets) |
 
 The saved logins are as sensitive as being signed in — treat that folder like a password.
 
