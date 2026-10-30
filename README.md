@@ -60,8 +60,13 @@ To start it automatically, open the gear menu and turn on **Launch at login**.
 
 - New and updated sessions are copied to every account; the newest version wins. Copies are APFS clones, so they use no real extra disk space.
 - Deleting a session on one account removes it everywhere — it's moved to `session-trash/`, never erased.
+- Conversation history needs no copying: it lives in `~/.claude/projects`, which every account already shares.
+- The Code archive state and backlog are merged too. Backlog items removed on one account are removed everywhere.
+- **Share scheduled tasks** (off by default) also merges Code scheduled tasks. They run on whichever account is active, so turning this on can restart tasks that stopped running when you left the account that owned them.
 - Each account's own Cowork settings and caches are left alone.
-- A brand-new account picks up the shared sessions on the switch after its first sign-in.
+- A brand-new account gets the shared sessions from **Sync Now** in the gear menu, or on the next switch. Both restart Claude.
+
+**Where did my sessions go?** Claude Desktop's *Archive inactive sessions* setting (Settings → Claude Code) also applies to shared sessions, so older ones land under Archived rather than in the main sidebar. They aren't lost; set it to never if you want them all visible.
 
 ## How it works
 

@@ -74,6 +74,7 @@ struct Settings: Codable, Equatable {
     var pollMinutes: Double = 5
     var carryOverOnSwitch = true     // copy the outgoing account's latest chat after switching
     var shareSessions = true         // show every account's Code & Cowork sessions on all accounts
+    var shareScheduledTasks = false  // off by default: copying a task restarts it on the active account
 
     init() {}
     init(from decoder: Decoder) throws {
@@ -85,6 +86,7 @@ struct Settings: Codable, Equatable {
         pollMinutes = try c.decodeIfPresent(Double.self, forKey: .pollMinutes) ?? d.pollMinutes
         carryOverOnSwitch = try c.decodeIfPresent(Bool.self, forKey: .carryOverOnSwitch) ?? d.carryOverOnSwitch
         shareSessions = try c.decodeIfPresent(Bool.self, forKey: .shareSessions) ?? d.shareSessions
+        shareScheduledTasks = try c.decodeIfPresent(Bool.self, forKey: .shareScheduledTasks) ?? d.shareScheduledTasks
     }
 }
 
@@ -440,7 +442,11 @@ enum Snapshot {
 struct SessionSyncResult {
     var copied = 0
     var trashed = 0
-    var summary: String { copied + trashed == 0 ? "Sessions already in sync" : "Synced sessions: \(copied) copied, \(trashed) removed" }
+    var listItems = 0
+    var summary: String {
+        copied + trashed + listItems == 0 ? "Sessions already in sync"
+            : "Synced sessions: \(copied) copied, \(trashed) removed, \(listItems) lists updated"
+    }
 }
 
 enum SessionSync {
@@ -450,7 +456,8 @@ enum SessionSync {
 
     /// `base` is Claude's data dir; `store` holds the manifest, trash and backups.
     static func sync(base: URL = Paths.claudeData, store: URL = Paths.support,
-                     ensure extra: [(account: String, org: String)] = []) throws -> SessionSyncResult {
+                     ensure extra: [(account: String, org: String)] = [],
+                     includeScheduledTasks: Bool = false) throws -> SessionSyncResult {
         let manifestURL = store.appendingPathComponent("session-manifest.json")
         var manifest = (try? JSONDecoder().decode([String: [String]].self, from: Data(contentsOf: manifestURL))) ?? [:]
         let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
@@ -512,10 +519,91 @@ enum SessionSync {
             }
 
             for folder in folders { manifest[folder.path] = Array(sessionIds(in: folder).keys).sorted() }
+
+            if rootName == "claude-code-sessions" {
+                try rebuildArchiveIndexes(folders)
+                result.listItems += try mergeList(file: "backlog/tasks.json", key: "items", folders, &manifest)
+                if includeScheduledTasks {
+                    result.listItems += try mergeList(file: "scheduled-tasks.json", key: "scheduledTasks", folders, &manifest)
+                }
+            }
         }
         try fm.createDirectory(at: store, withIntermediateDirectories: true)
         try JSONEncoder().encode(manifest).write(to: manifestURL, options: .atomic)
         return result
+    }
+
+    /// Claude's archive index goes stale once sessions are merged, so each folder's is rebuilt from its session files.
+    static func rebuildArchiveIndexes(_ folders: [URL]) throws {
+        for folder in folders {
+            let archived = sessionIds(in: folder).keys.filter { id in
+                let file = folder.appendingPathComponent(id + ".json")
+                let json = (try? Data(contentsOf: file)).flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any]
+                return json?["isArchived"] as? Bool == true
+            }.sorted()
+            let url = folder.appendingPathComponent("archived-sessions.idx")
+            let current = (try? Data(contentsOf: url)).flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any]
+            if ((current?["archived"] as? [String]) ?? []).sorted() == archived && (current != nil || archived.isEmpty) { continue }
+            let data = try JSONSerialization.data(withJSONObject: ["v": 1, "archived": archived] as [String: Any])
+            try data.write(to: url, options: .atomic)
+        }
+    }
+
+    /// Merges a JSON file holding a list of `{id: ...}` items across folders; returns how many folders were rewritten.
+    /// For an id in several folders the copy in the newest file wins; an id gone from a folder since the last
+    /// sync was removed there, so it is removed everywhere.
+    static func mergeList(file: String, key: String, _ folders: [URL], _ manifest: inout [String: [String]]) throws -> Int {
+        struct Source { var folder: URL; var mtime: Date; var top: [String: Any]; var items: [[String: Any]] }
+        var sources: [Source] = []
+        for folder in folders {
+            let url = folder.appendingPathComponent(file)
+            guard let data = try? Data(contentsOf: url),
+                  let top = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+            let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            sources.append(Source(folder: folder, mtime: mtime, top: top, items: top[key] as? [[String: Any]] ?? []))
+        }
+        guard !sources.isEmpty else { return 0 }
+        sources.sort { $0.mtime > $1.mtime }
+
+        var deleted = Set<String>()
+        for s in sources {
+            if let before = manifest["\(s.folder.path)#\(file)"] {
+                deleted.formUnion(Set(before).subtracting(s.items.compactMap { $0["id"] as? String }))
+            }
+        }
+        var merged: [[String: Any]] = [], seen = Set<String>()
+        for s in sources {
+            for item in s.items {
+                guard let id = item["id"] as? String, !deleted.contains(id), seen.insert(id).inserted else { continue }
+                var winner = item
+                // Run history only moves forward, whichever file won.
+                for field in ["lastRunAt", "lastScheduledFor"] {
+                    let times = sources.flatMap { $0.items }.filter { $0["id"] as? String == id }.compactMap { $0[field] as? String }
+                    if let latest = times.max() { winner[field] = latest }
+                }
+                merged.append(winner)
+            }
+        }
+
+        var rewritten = 0
+        let ids = merged.compactMap { $0["id"] as? String }.sorted()
+        for folder in folders {
+            let existing = sources.first { $0.folder == folder }
+            let url = folder.appendingPathComponent(file)
+            var top = existing?.top ?? sources[0].top
+            top[key] = merged
+            let options: JSONSerialization.WritingOptions = [.sortedKeys, .withoutEscapingSlashes]
+            let new = try JSONSerialization.data(withJSONObject: top, options: options)
+            let old = try existing.map { try JSONSerialization.data(withJSONObject: $0.top, options: options) }
+            if new != old {
+                try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try JSONSerialization.data(withJSONObject: top, options: [.prettyPrinted, .withoutEscapingSlashes])
+                    .write(to: url, options: .atomic)
+                rewritten += 1
+            }
+            manifest["\(folder.path)#\(file)"] = ids
+        }
+        return rewritten
     }
 
     /// <root>/<accountUuid>/<orgUuid> folders (skips non-account dirs like skills-plugin).
@@ -779,15 +867,29 @@ final class AppModel: ObservableObject {
         ClaudeDesktop.launch()
     }
 
+    /// Syncs without switching, e.g. to bring sessions to an account that just signed in for the first time.
+    func promptSyncNow() {
+        guard busy == nil, confirm("Sync Code sessions now?", "Claude Desktop will quit and relaunch — running chats and Code sessions are interrupted.", ok: "Sync") else { return }
+        let org = active?.orgId
+        Task {
+            await perform("Syncing Code & Cowork sessions…") {
+                try await ClaudeDesktop.quit()
+                await self.syncSessions(org: org)
+                ClaudeDesktop.launch()
+            }
+        }
+    }
+
     /// Merges Code & Cowork sessions across accounts. Never blocks a switch: failures are only reported.
     private func syncSessions(org: String?) async {
         busy = "Syncing Code & Cowork sessions…"
         let account = (try? Snapshot.readConfig())?["lastKnownAccountUuid"] as? String
         let ensure = [account, org].allSatisfy { $0 != nil } ? [(account!, org!)] : []
+        let includeTasks = state.settings.shareScheduledTasks
         let result = await Task.detached { () -> Result<SessionSyncResult, Error> in
             Result {
                 try SessionSync.backup()
-                return try SessionSync.sync(ensure: ensure)
+                return try SessionSync.sync(ensure: ensure, includeScheduledTasks: includeTasks)
             }
         }.value
         switch result {
@@ -1237,6 +1339,15 @@ struct SettingsPanel: View {
             SettingRow(title: "Share Code & Cowork sessions", subtitle: "Every account sees the same sidebar") {
                 Toggle("", isOn: $model.state.settings.shareSessions).toggleStyle(.switch).controlSize(.mini).labelsHidden()
             }
+            SettingRow(title: "Share scheduled tasks", subtitle: "They run on whichever account is active") {
+                Toggle("", isOn: $model.state.settings.shareScheduledTasks).toggleStyle(.switch).controlSize(.mini).labelsHidden()
+            }
+            .disabled(!model.state.settings.shareSessions)
+            SettingRow(title: "Sync sessions", subtitle: "Without switching accounts") {
+                Button("Sync Now") { model.promptSyncNow() }
+                    .buttonStyle(PillButtonStyle(prominent: false))
+                    .disabled(model.busy != nil || !model.state.settings.shareSessions)
+            }
             SettingRow(title: "Launch at login") {
                 Toggle("", isOn: Binding(get: { model.launchAtLogin }, set: { model.setLaunchAtLogin($0) }))
                     .toggleStyle(.switch).controlSize(.mini).labelsHidden()
@@ -1370,7 +1481,8 @@ enum Entry {
         if let i = CommandLine.arguments.firstIndex(of: "--sync-sessions"), i + 2 < CommandLine.arguments.count {
             // Test hook: --sync-sessions <claude-data-dir> <store-dir>
             let base = URL(fileURLWithPath: CommandLine.arguments[i + 1]), store = URL(fileURLWithPath: CommandLine.arguments[i + 2])
-            do { print(try SessionSync.sync(base: base, store: store).summary) } catch { print("error: \(error.localizedDescription)") }
+            let tasks = CommandLine.arguments.contains("--scheduled-tasks")
+            do { print(try SessionSync.sync(base: base, store: store, includeScheduledTasks: tasks).summary) } catch { print("error: \(error.localizedDescription)") }
             return
         }
         if let i = CommandLine.arguments.firstIndex(of: "--snapshot"), i + 1 < CommandLine.arguments.count {
