@@ -15,6 +15,7 @@ import Security
 import ServiceManagement
 import SQLite3
 import SwiftUI
+import UserNotifications
 
 // MARK: - Constants
 
@@ -65,10 +66,72 @@ struct Usage: Codable, Equatable {
     var sevenDayResets: Date?
     var fetchedAt: Date
     var cached = false
+    var models: [ModelLimit]? = nil  // per-model weekly limits, e.g. Fable
+    var resets: [ResetGrant]? = nil  // limit resets the account can use; nil when it isn't eligible
+    var credits: Credits? = nil      // usage credits (pay-as-you-go past the plan limits)
 
     /// Utilization in percent, treating a window whose reset time has passed as empty.
     var fh: Double { (fiveHourResets.map { $0 < Date() } ?? false) ? 0 : (fiveHour ?? 0) }
     var sd: Double { (sevenDayResets.map { $0 < Date() } ?? false) ? 0 : (sevenDay ?? 0) }
+}
+
+/// A weekly limit that applies to one model only, from the `limits` list of the usage response.
+struct ModelLimit: Codable, Equatable {
+    var name: String
+    var percent: Double
+    var resets: Date?
+    var used: Double { (resets.map { $0 < Date() } ?? false) ? 0 : percent }
+}
+
+/// A batch of limit resets from the usage response's `cedar_ember.grants`: each one empties
+/// the windows in `clears` (and the weekly window when `weekly` is set).
+/// Usage credits from the usage response's `spend` object. Amounts are in major units (dollars).
+struct Credits: Codable, Equatable {
+    var enabled: Bool
+    var balance: Double?
+    var used: Double?
+    var limit: Double?
+    var currency: String
+    var reason: String?
+
+    func money(_ v: Double) -> String {
+        let f = NumberFormatter()
+        f.numberStyle = .currency
+        f.currencyCode = currency
+        f.maximumFractionDigits = v == v.rounded() ? 0 : 2
+        return f.string(from: v as NSNumber) ?? "\(v)"
+    }
+    /// What happens at the plan limit, in one line.
+    var summary: String {
+        if enabled {
+            let used = money(self.used ?? 0)
+            return limit.map { "\(used) of \(money($0)) used this month" } ?? "\(used) used this month"
+        }
+        return reason == "out_of_credits" ? "Off · out of credits" : "Off · \(money(balance ?? 0)) balance"
+    }
+}
+
+struct ResetGrant: Codable, Equatable {
+    var label: String?
+    var left: Int
+    var total: Int
+    var ends: Date?
+    var clears: [String]
+    var weekly: Bool
+    var paused: Bool
+
+    var live: Bool { !paused && (ends.map { $0 > Date() } ?? true) }
+    /// `gives_back_weekly` refills a model's own weekly limit (named in the label), not the overall one.
+    var model: String { label?.contains("Fable") == true ? "Fable" : "model" }
+    var full: Bool { clears.contains("seven_day") }
+    var title: String { full ? "Full reset" : weekly ? "\(model.capitalized) reset" : "Session reset" }
+    var clearsText: String {
+        var parts: [String] = []
+        if clears.contains("five_hour") { parts.append("5-hour") }
+        if full { parts.append("weekly") }
+        if weekly { parts.append("\(model) weekly") }
+        return parts.isEmpty ? "limits" : parts.joined(separator: " + ")
+    }
 }
 
 struct Profile: Codable, Identifiable, Equatable {
@@ -91,6 +154,7 @@ struct Settings: Codable, Equatable {
     var shareScheduledTasks = false  // off by default: copying a task restarts it on the active account
     var switchChromeExtension = false // off by default: quits and reopens Chrome on every switch
     var chromeProfileDir: String?
+    var notify = true                // usage warnings and reset notices
 
     init() {}
     init(from decoder: Decoder) throws {
@@ -104,6 +168,7 @@ struct Settings: Codable, Equatable {
         shareScheduledTasks = try c.decodeIfPresent(Bool.self, forKey: .shareScheduledTasks) ?? d.shareScheduledTasks
         switchChromeExtension = try c.decodeIfPresent(Bool.self, forKey: .switchChromeExtension) ?? d.switchChromeExtension
         chromeProfileDir = try c.decodeIfPresent(String.self, forKey: .chromeProfileDir)
+        notify = try c.decodeIfPresent(Bool.self, forKey: .notify) ?? d.notify
     }
 }
 
@@ -276,12 +341,12 @@ enum UsageClient {
         let (sk, cookieOrg) = try login(cookiesDB: cookiesDB)
         var org = cookieOrg ?? knownOrg
         var json: [String: Any]
-        if let o = org, let j = try? await get("/api/organizations/\(o)/usage", sessionKey: sk) as? [String: Any] {
+        if let o = org, let j = try? await get("/api/organizations/\(o)/usage?cedar_ember=1", sessionKey: sk) as? [String: Any] {
             json = j
         } else {
             let o = try await pickOrg(sessionKey: sk)
             org = o
-            json = try await get("/api/organizations/\(o)/usage", sessionKey: sk) as? [String: Any] ?? [:]
+            json = try await get("/api/organizations/\(o)/usage?cedar_ember=1", sessionKey: sk) as? [String: Any] ?? [:]
         }
 
         func window(_ key: String) -> (Double?, Date?) {
@@ -290,11 +355,46 @@ enum UsageClient {
         }
         let (fh, fhr) = window("five_hour")
         let (sd, sdr) = window("seven_day")
+        var models: [ModelLimit] = []
+        for case let l as [String: Any] in json["limits"] as? [Any] ?? [] {
+            let kind = l["kind"] as? String ?? "?"
+            let name = ((l["scope"] as? [String: Any])?["model"] as? [String: Any])?["display_name"] as? String
+            let pct = ((l["percent"] ?? l["utilization"]) as? NSNumber)?.doubleValue
+            guard kind == "weekly_scoped", let name, let pct else { continue }
+            models.append(ModelLimit(name: name, percent: pct,
+                                     resets: (l["resets_at"] as? String).flatMap(parseISODate)))
+        }
+        var credits: Credits?
+        if let sp = json["spend"] as? [String: Any] {
+            func money(_ k: String) -> (Double, String?)? {
+                guard let m = sp[k] as? [String: Any], let minor = (m["amount_minor"] as? NSNumber)?.doubleValue else { return nil }
+                let exp = (m["exponent"] as? NSNumber)?.intValue ?? 2
+                return (minor / pow(10, Double(exp)), m["currency"] as? String)
+            }
+            let used = money("used"), limit = money("limit"), balance = money("balance")
+            credits = Credits(enabled: sp["enabled"] as? Bool == true, balance: balance?.0, used: used?.0, limit: limit?.0,
+                              currency: used?.1 ?? limit?.1 ?? balance?.1 ?? "USD",
+                              reason: sp["disabled_reason"] as? String)
+        }
+        var resets: [ResetGrant]?
+        if let ce = json["cedar_ember"] as? [String: Any], ce["eligible"] as? Bool == true {
+            resets = []
+            for case let g as [String: Any] in ce["grants"] as? [Any] ?? [] {
+                guard let total = (g["resets_total"] as? NSNumber)?.intValue, total > 0,
+                      let left = (g["resets_left"] as? NSNumber)?.intValue else { continue }
+                resets?.append(ResetGrant(label: g["label"] as? String, left: min(left, total), total: total,
+                                          ends: (g["ends_at"] as? String).flatMap(parseISODate),
+                                          clears: g["clears"] as? [String] ?? [],
+                                          weekly: g["gives_back_weekly"] as? Bool == true,
+                                          paused: g["paused"] as? Bool == true))
+            }
+        }
         var email: String?
         if wantEmail, let acct = try? await get("/api/account", sessionKey: sk) as? [String: Any] {
             email = acct["email_address"] as? String
         }
-        return FetchResult(usage: Usage(fiveHour: fh, fiveHourResets: fhr, sevenDay: sd, sevenDayResets: sdr, fetchedAt: Date()),
+        return FetchResult(usage: Usage(fiveHour: fh, fiveHourResets: fhr, sevenDay: sd, sevenDayResets: sdr, fetchedAt: Date(),
+                                         models: models.isEmpty ? nil : models, resets: resets, credits: credits),
                            orgId: org!, email: email)
     }
 }
@@ -842,7 +942,8 @@ struct PermissionCheck: Identifiable, Equatable {
 }
 
 enum Permissions {
-    static func check() -> [PermissionCheck] {
+    /// Chrome's data (Full Disk Access) is only checked when the extension switch is on, so it is never asked for otherwise.
+    static func check(chrome: Bool) -> [PermissionCheck] {
         func read(_ url: URL) -> String? {
             guard FileManager.default.fileExists(atPath: url.path) else { return nil }
             do {
@@ -858,7 +959,7 @@ enum Permissions {
         var keychain: String?
         do { _ = try ChromeCrypto.key() } catch { keychain = error.localizedDescription }
         checks.append(PermissionCheck(name: "“Claude Safe Storage” in Keychain", purpose: "To check usage on every account. Choose Always Allow.", problem: keychain))
-        if FileManager.default.fileExists(atPath: ChromeExtension.dataDir.path) {
+        if chrome, FileManager.default.fileExists(atPath: ChromeExtension.dataDir.path) {
             let chrome = ChromeExtension.suggestedProfile().map { ChromeExtension.dataDir.appendingPathComponent($0).appendingPathComponent("Cookies") }
             let blocked = read(ChromeExtension.dataDir.appendingPathComponent("Local State")) ?? chrome.flatMap(read)
             checks.append(PermissionCheck(name: "Chrome data", purpose: "To switch the Claude in Chrome extension",
@@ -964,6 +1065,8 @@ final class AppModel: ObservableObject {
     private var timer: Timer?
     private var refreshing = false
     private var lastAutoPrompt: Date?
+    /// False for snapshot/demo models: no notifications, no refresh on open.
+    private var live = false
 
     init(autoRefresh: Bool = true) {
         if let data = try? Data(contentsOf: Paths.state), let s = try? JSONDecoder.app.decode(AppState.self, from: data) {
@@ -973,6 +1076,8 @@ final class AppModel: ObservableObject {
         }
         try? FileManager.default.createDirectory(at: Paths.profiles, withIntermediateDirectories: true)
         guard autoRefresh else { return }
+        live = true
+        Notifier.setUp()
         timer = Timer.scheduledTimer(withTimeInterval: max(1, state.settings.pollMinutes) * 60, repeats: true) { [weak self] _ in
             Task { await self?.refreshAll() }
         }
@@ -988,7 +1093,8 @@ final class AppModel: ObservableObject {
 
     /// Runs off the main thread: each check can block on a system prompt until it's answered.
     func checkPermissions() async {
-        permissions = await Task.detached { Permissions.check() }.value
+        let chrome = state.settings.switchChromeExtension
+        permissions = await Task.detached { Permissions.check(chrome: chrome) }.value
     }
 
     var active: Profile? { state.profiles.first { $0.id == state.activeId } }
@@ -999,8 +1105,19 @@ final class AppModel: ObservableObject {
         func usage(_ fh: Double, _ fhIn: Double, _ sd: Double, _ sdIn: Double) -> Usage {
             Usage(fiveHour: fh, fiveHourResets: now + fhIn * 3600, sevenDay: sd, sevenDayResets: now + sdIn * 3600, fetchedAt: now)
         }
-        let personal = Profile(name: "Personal", email: "alex@example.com", usage: usage(42, 2.6, 18, 90))
-        let work = Profile(name: "Work", email: "alex@acme.example", usage: usage(93, 0.7, 64, 40))
+        var personal = Profile(name: "Personal", email: "alex@example.com", usage: usage(42, 2.6, 18, 90))
+        personal.usage?.models = [ModelLimit(name: "Fable", percent: 9, resets: now + 90 * 3600)]
+        personal.usage?.resets = []
+        var work = Profile(name: "Work", email: "alex@acme.example", usage: usage(93, 0.7, 64, 40))
+        work.usage?.models = [ModelLimit(name: "Fable", percent: 71, resets: now + 40 * 3600)]
+        work.usage?.resets = [
+            ResetGrant(label: "One full limit reset", left: 1, total: 1, ends: now + 700 * 3600,
+                       clears: ["five_hour", "seven_day"], weekly: false, paused: false),
+            ResetGrant(label: "One Fable reset", left: 1, total: 1, ends: now + 60 * 3600,
+                       clears: ["five_hour"], weekly: true, paused: false),
+        ]
+        work.usage?.credits = Credits(enabled: true, balance: nil, used: 4.2, limit: 20, currency: "USD", reason: nil)
+        personal.usage?.credits = Credits(enabled: false, balance: 0, used: 0, limit: nil, currency: "USD", reason: nil)
         let side = Profile(name: "Side Project", email: "alex.builds@example.com", usage: usage(3, 4.9, 27, 130))
         isDemo = true
         state = AppState(profiles: [work, personal, side], activeId: work.id, settings: state.settings)
@@ -1057,6 +1174,83 @@ final class AppModel: ObservableObject {
         }
         lastRefresh = Date()
         evaluateAutoSwitch()
+        if live && state.settings.notify { checkAlerts() }
+    }
+
+    /// Refreshes when the panel opens, unless the numbers are under a minute old.
+    func refreshIfStale() {
+        guard live, busy == nil, lastRefresh.map({ Date().timeIntervalSince($0) > 60 }) ?? true else { return }
+        Task { await refreshAll() }
+    }
+
+    // MARK: Notifications
+
+    /// One notice per account, window and reset: projected to run out, at 90%, and (only for a window that was
+    /// warned about) when it resets. Remembered in alerts.json so a relaunch doesn't repeat them.
+    func checkAlerts() {
+        let url = Paths.support.appendingPathComponent("alerts.json")
+        var records = (try? JSONDecoder.app.decode([String: AlertRecord].self, from: Data(contentsOf: url))) ?? [:]
+        let before = records
+        let now = Date()
+
+        for (key, rec) in records where rec.resets <= now {
+            records[key] = nil
+            let parts = key.split(separator: "|")
+            guard parts.count == 2, !parts[1].hasPrefix("expire"),
+                  let p = state.profiles.first(where: { $0.id.uuidString == parts[0] }) else { continue }
+            let label = parts[1] == "5h" ? "5-hour" : parts[1] == "7d" ? "weekly" : "weekly \(parts[1].dropFirst(3))"
+            Notifier.post("\(p.name): \(label) limit has reset",
+                          "\(p.email ?? p.name) is ready to use again.")
+        }
+
+        for p in state.profiles {
+            guard let u = p.usage, !u.cached else { continue }
+            var windows: [(key: String, label: String, used: Double, resets: Date?, length: TimeInterval)] = [
+                ("5h", "5-hour", u.fh, u.fiveHourResets, 5 * 3600),
+                ("7d", "weekly", u.sd, u.sevenDayResets, 7 * 86400),
+            ]
+            for m in u.models ?? [] {
+                windows.append(("7d-\(m.name)", "weekly \(m.name)", m.used, m.resets, 7 * 86400))
+            }
+            for w in windows {
+                guard let resets = w.resets, resets > now else { continue }
+                let key = "\(p.id.uuidString)|\(w.key)"
+                // A record from an earlier window of the same account no longer applies.
+                var rec = records[key].flatMap { abs($0.resets.timeIntervalSince(resets)) < 600 ? $0 : nil }
+                    ?? AlertRecord(resets: resets)
+                if w.used >= 90, !rec.high {
+                    rec.high = true
+                    Notifier.post("\(p.name) is at \(Int(w.used))% of its \(w.label) limit", "Resets \(resetText(resets)).")
+                } else if w.used < 90, !rec.high, !rec.runsOut,
+                          let out = pace(used: w.used, resets: resets, window: w.length)?.runsOut {
+                    rec.runsOut = true
+                    Notifier.post("\(p.name) will run out of its \(w.label) limit",
+                                  "At this rate: \(resetText(out)). It resets \(resetText(resets)).")
+                }
+                if rec.high || rec.runsOut { records[key] = rec }
+            }
+
+            // Unused free resets: remind 3 days and 1 day before they expire.
+            // `high` marks the 3-day reminder as sent, `runsOut` the 1-day one.
+            for g in u.resets ?? [] where g.live && g.left > 0 {
+                guard let ends = g.ends, ends > now else { continue }
+                let left = ends.timeIntervalSince(now)
+                guard left <= 3 * 86400 else { continue }
+                let key = "\(p.id.uuidString)|expire-\(g.title)-\(Int(ends.timeIntervalSince1970))"
+                var rec = records[key] ?? AlertRecord(resets: ends)
+                let lastDay = left <= 86400
+                guard lastDay ? !rec.runsOut : !rec.high else { continue }
+                rec.high = true
+                rec.runsOut = rec.runsOut || lastDay
+                records[key] = rec
+                let h = Int(left / 3600)
+                Notifier.post("\(p.name): unused \(g.title.lowercased()) expires in \(h < 24 ? "\(h)h" : "\(h / 24)d")",
+                              "It clears the \(g.clearsText) limits. Use it in claude.ai → Settings → Usage before \(resetText(ends)).")
+            }
+        }
+        if records != before, let data = try? JSONEncoder.app.encode(records) {
+            try? data.write(to: url, options: .atomic)
+        }
     }
 
     // MARK: Auto-switch
@@ -1370,13 +1564,77 @@ func resetText(_ date: Date?) -> String {
     guard let date else { return "" }
     let secs = date.timeIntervalSinceNow
     if secs <= 0 { return "reset" }
-    if secs >= 24 * 3600 {
-        let f = DateFormatter()
-        f.dateFormat = "EEE h a"
-        return f.string(from: date)
+    // Clock time (with the weekday unless it's today, in the user's 12/24-hour setting) plus the countdown.
+    let f = DateFormatter()
+    // Beyond a week the weekday alone is ambiguous, so show the date.
+    f.setLocalizedDateFormatFromTemplate(Calendar.current.isDateInToday(date) ? "jmm" : secs > 6 * 86400 ? "MMMdjmm" : "EEEjmm")
+    let m = Int(secs) / 60, h = m / 60, d = h / 24
+    let left = d > 6 ? "\(d)d" : d > 0 ? "\(d)d \(h % 24)h" : h > 0 ? "\(h)h \(m % 60)m" : "\(m)m"
+    return "\(f.string(from: date)) · in \(left)"
+}
+
+/// Where usage would be at an even burn rate, and when the current rate runs it out (if before the reset).
+struct Pace {
+    var expected: Double  // percent of the window elapsed
+    var delta: Double     // used − expected, in percentage points
+    var runsOut: Date?
+}
+
+/// Pace for a window of `window` seconds ending at `resets`, or nil when it's too early in the window to judge.
+func pace(used: Double, resets: Date?, window: TimeInterval, now: Date = Date()) -> Pace? {
+    guard let resets, resets > now else { return nil }
+    let elapsed = window - resets.timeIntervalSince(now)
+    guard elapsed > window * 0.05 else { return nil }
+    let expected = min(100, elapsed / window * 100)
+    var runsOut: Date?
+    // Only clearly ahead of pace: a lead of a point or two projects a run-out minutes before the reset.
+    if used - expected >= 5, used < 100 {
+        let t = now + (100 - used) / (used / elapsed)
+        if t < resets { runsOut = t }
     }
-    let h = Int(secs) / 3600, m = (Int(secs) % 3600) / 60
-    return h > 0 ? "in \(h)h \(m)m" : "in \(m)m"
+    return Pace(expected: expected, delta: used - expected, runsOut: runsOut)
+}
+
+/// Which notices were sent for one account's window, keyed to that window's reset time.
+struct AlertRecord: Codable, Equatable {
+    var resets: Date
+    var high = false
+    var runsOut = false
+}
+
+enum Notifier {
+    /// Shows banners even while the panel has focus (macOS hides them for the frontmost app by default).
+    final class Delegate: NSObject, UNUserNotificationCenterDelegate {
+        func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
+                                    withCompletionHandler done: @escaping (UNNotificationPresentationOptions) -> Void) {
+            done([.banner, .sound])
+        }
+    }
+    private static let delegate = Delegate()
+
+    static func setUp() {
+        let center = UNUserNotificationCenter.current()
+        center.delegate = delegate
+        center.requestAuthorization(options: [.alert, .sound]) { ok, error in
+            switchLog("notifications: authorized=\(ok)\(error.map { " error=\($0.localizedDescription)" } ?? "")")
+        }
+    }
+
+    static func post(_ title: String, _ body: String) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
+        switchLog("notify: \(title)")
+    }
+}
+
+func paceText(_ p: Pace) -> String {
+    let d = Int(p.delta.rounded())
+    var s = abs(d) < 5 ? "On track" : d > 0 ? "\(d)% ahead of pace" : "\(-d)% under pace"
+    if let t = p.runsOut { s += " · runs out \(resetText(t))" }
+    return s
 }
 
 /// Template ring for the menubar, filled to the active account's 5-hour usage.
@@ -1425,31 +1683,98 @@ struct Meter: View {
     let title: String
     let value: Double
     let reset: Date?
+    var window: TimeInterval? = nil
 
     var body: some View {
         let color = Color.level(value)
-        VStack(alignment: .leading, spacing: 4) {
+        let p = window.flatMap { pace(used: value, resets: reset, window: $0) }
+        VStack(alignment: .leading, spacing: 5) {
             HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text(title).font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
-                Spacer()
+                Text(title).font(.system(size: 12, weight: .semibold)).foregroundStyle(.primary.opacity(0.9))
+                    .lineLimit(1).layoutPriority(1)
+                Spacer(minLength: 4)
                 if reset != nil {
-                    Text(resetText(reset)).font(.system(size: 10)).foregroundStyle(.tertiary)
+                    Text(resetText(reset)).font(.system(size: 11)).foregroundStyle(.secondary)
+                        .lineLimit(1).minimumScaleFactor(0.85)
+                } else if value == 0 {
+                    // An idle window has no reset time until the next message starts it.
+                    Text("Not started").font(.system(size: 11)).foregroundStyle(.secondary)
                 }
                 Text("\(Int(value.rounded()))%")
-                    .font(.system(size: 11, weight: .semibold, design: .rounded)).monospacedDigit()
+                    .font(.system(size: 13, weight: .bold, design: .rounded)).monospacedDigit()
                     .foregroundStyle(value >= 70 ? color : .primary)
-                    .frame(minWidth: 30, alignment: .trailing)
+                    .frame(minWidth: 34, alignment: .trailing)
             }
             GeometryReader { g in
                 ZStack(alignment: .leading) {
-                    Capsule().fill(Color.primary.opacity(0.08))
+                    Capsule().fill(Color.primary.opacity(0.14))
                     Capsule()
-                        .fill(LinearGradient(colors: [color.opacity(0.7), color], startPoint: .leading, endPoint: .trailing))
-                        .frame(width: value > 0 ? max(5, g.size.width * min(value, 100) / 100) : 0)
+                        .fill(color)
+                        .frame(width: value > 0 ? max(7, g.size.width * min(value, 100) / 100) : 0)
+                    if let p {
+                        // Tick where an even burn rate would be by now.
+                        RoundedRectangle(cornerRadius: 1)
+                            .fill(Color.primary)
+                            .frame(width: 2.5, height: 11)
+                            .shadow(color: .black.opacity(0.5), radius: 0.5)
+                            .offset(x: max(0, g.size.width * p.expected / 100 - 1.25))
+                    }
+                }
+                .frame(height: 11)
+            }
+            .frame(height: 11)
+            .animation(.easeOut(duration: 0.4), value: value)
+            if let p {
+                Text(paceText(p))
+                    .font(.system(size: 11, weight: p.runsOut != nil ? .medium : .regular))
+                    .foregroundStyle(p.runsOut != nil ? AnyShapeStyle(Color.level(90)) : p.delta >= 5 ? AnyShapeStyle(Color.level(70)) : AnyShapeStyle(.secondary))
+                    .lineLimit(1).minimumScaleFactor(0.85)
+            }
+        }
+    }
+}
+
+/// How many limit resets an account has left, what they clear and when they expire.
+struct ResetsRow: View {
+    let grants: [ResetGrant]?
+    var credits: Credits? = nil
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if grants?.isEmpty == true {
+                row(icon: "arrow.counterclockwise", text: Text("No limit resets available"), detail: nil, dim: true)
+            }
+            ForEach(Array((grants ?? []).enumerated()), id: \.offset) { _, g in
+                row(icon: "arrow.counterclockwise",
+                    text: Text(g.title).fontWeight(.semibold)
+                        + Text(g.total > 1 ? " · \(g.left) of \(g.total) left" : "")
+                        + Text(" · clears \(g.clearsText)"),
+                    detail: g.ends.map { "Expires \(resetText($0))" },
+                    dim: false)
+                .help(g.label ?? g.title)
+            }
+            if let c = credits {
+                row(icon: "creditcard",
+                    text: Text("Usage credits").fontWeight(.semibold) + Text(" · \(c.summary)"),
+                    detail: c.enabled ? "Keeps you going past the plan limits" : "You'll be stopped at the plan limits",
+                    dim: !c.enabled)
+            }
+        }
+        .padding(.horizontal, 9).padding(.vertical, 7)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color.primary.opacity(0.06)))
+    }
+
+    func row(icon: String, text: Text, detail: String?, dim: Bool) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Image(systemName: icon).font(.system(size: 10, weight: .bold))
+                .foregroundStyle(dim ? AnyShapeStyle(.secondary) : AnyShapeStyle(Color.claude))
+            VStack(alignment: .leading, spacing: 1) {
+                text.font(.system(size: 11)).foregroundStyle(dim ? .secondary : .primary)
+                if let detail {
+                    Text(detail).font(.system(size: 10.5)).foregroundStyle(.secondary)
                 }
             }
-            .frame(height: 5)
-            .animation(.easeOut(duration: 0.4), value: value)
         }
     }
 }
@@ -1546,8 +1871,15 @@ struct AccountCard: View {
 
             if let u = profile.usage {
                 VStack(spacing: 9) {
-                    Meter(title: "5-hour session", value: u.fh, reset: u.fiveHourResets)
-                    Meter(title: "Weekly", value: u.sd, reset: u.sevenDayResets)
+                    Meter(title: "5-hour session", value: u.fh, reset: u.fiveHourResets, window: 5 * 3600)
+                    Meter(title: "Weekly", value: u.sd, reset: u.sevenDayResets, window: 7 * 86400)
+                    ForEach(u.models ?? [], id: \.name) { m in
+                        Meter(title: "Weekly · \(m.name)", value: m.used, reset: m.resets, window: 7 * 86400)
+                    }
+                }
+                if u.resets != nil || u.credits != nil {
+                    ResetsRow(grants: u.resets.map { $0.filter { $0.live && $0.left > 0 }.sorted { $0.full && !$1.full } },
+                              credits: u.credits)
                 }
                 if u.cached {
                     Text("Cached · \(u.fetchedAt.formatted(date: .omitted, time: .shortened))")
@@ -1570,7 +1902,7 @@ struct AccountCard: View {
         .padding(12)
         .background(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(Color.primary.opacity(isActive ? 0.055 : (hovering ? 0.045 : 0.025)))
+                .fill(Color.primary.opacity(isActive ? 0.07 : (hovering ? 0.06 : 0.04)))
         )
         .overlay(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
@@ -1632,6 +1964,7 @@ struct SettingsPanel: View {
                         model.state.settings.chromeProfileDir = ChromeExtension.suggestedProfile()
                     }
                     model.state.settings.switchChromeExtension = on
+                    Task { await model.checkPermissions() }
                     if on && !AccessHelper.chromeReadable { AccessHelper.show(model: model) }
                 })).toggleStyle(.switch).controlSize(.mini).labelsHidden()
             }
@@ -1648,6 +1981,9 @@ struct SettingsPanel: View {
                 Button("Sync Now") { model.promptSyncNow() }
                     .buttonStyle(PillButtonStyle(prominent: false))
                     .disabled(model.busy != nil || !model.state.settings.shareSessions)
+            }
+            SettingRow(title: "Notifications", subtitle: "Run-out and 90% warnings, limit resets") {
+                Toggle("", isOn: $model.state.settings.notify).toggleStyle(.switch).controlSize(.mini).labelsHidden()
             }
             SettingRow(title: "Launch at login") {
                 Toggle("", isOn: Binding(get: { model.launchAtLogin }, set: { model.setLaunchAtLogin($0) }))
@@ -1783,6 +2119,11 @@ struct MenuContent: View {
         }
         .padding(14)
         .frame(width: 344)
+        // Mostly opaque backing so the wallpaper behind the glass doesn't wash out the text.
+        .background(Color(nsColor: .windowBackgroundColor).opacity(0.92))
+        // The panel's window becomes key each time it opens.
+        .onAppear { model.refreshIfStale() }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in model.refreshIfStale() }
     }
 }
 
