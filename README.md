@@ -8,7 +8,10 @@ A macOS menu bar app for people with more than one Claude account. It tracks eve
   <img src="docs/screenshot-dark.png" width="344" alt="Claude Switcher in dark mode">
 </p>
 
-- **Live usage for every account.** 5-hour and weekly limits with reset times, even for accounts you're not signed into. The menu bar ring shows the active account at a glance.
+- **Live usage for every account.** 5-hour, weekly and per-model weekly limits (such as Fable) with reset times, even for accounts you're not signed into. The menu bar ring shows the active account at a glance.
+- **Pace.** Each limit shows whether you're ahead of or under an even burn rate, and when you'll run out at the current rate.
+- **Limit resets and usage credits.** See which free limit resets each account has, what they clear and when they expire, and whether usage credits will keep you going past the limits.
+- **Notifications.** A heads-up when an account will run out before its reset or passes 90%, when a limit you were warned about resets, and 3 days and 1 day before an unused reset expires. Turn them off in Settings.
 - **One-click switching.** Claude quits, the switcher swaps the saved login, Claude reopens on the other account (~5 seconds).
 - **Auto-switch.** When the active account passes a threshold (default 90% of the 5-hour limit), it asks — or just switches — to the account with the most room.
 - **Your sidebar follows you.** Claude Code and Cowork sessions are shared across all accounts.
@@ -89,7 +92,7 @@ A saved account is a snapshot of just Claude Desktop's login state — `Cookies`
 
 Switching asks Claude to quit (it's never force-killed; if it refuses, nothing changes), backs up the current login, saves it to the outgoing account, restores the target account, syncs sessions, and relaunches Claude.
 
-Usage is read by decrypting each account's claude.ai session cookie with the key in the "Claude Safe Storage" keychain item, then calling `claude.ai/api/organizations/{org}/usage`. If that fails, it falls back to the usage history Claude Desktop records itself.
+Usage is read by decrypting each account's claude.ai session cookie with the key in the "Claude Safe Storage" keychain item, then calling `claude.ai/api/organizations/{org}/usage?cedar_ember=1` (the same request claude.ai's Usage settings make; the flag adds limit resets to the response). Per-model limits come from its `limits` list, resets from `cedar_ember` and usage credits from `spend`. Nothing is ever claimed or changed. If that fails, it falls back to the usage history Claude Desktop records itself.
 
 Everything stays on your Mac, in `~/Library/Application Support/ClaudeSwitcher/`:
 
@@ -102,6 +105,7 @@ Everything stays on your Mac, in `~/Library/Application Support/ClaudeSwitcher/`
 | `chrome-extension/` | Saved extension data and Chrome's claude.ai cookies, per account |
 | `backups-chrome/` | Extension storage before each switch (last 3) |
 | `state.json` | Accounts, last known usage, settings |
+| `alerts.json` | Which notifications were already sent for each limit window |
 | `switcher.log` | Each switch step, for troubleshooting (no secrets) |
 
 The saved logins are as sensitive as being signed in — treat that folder like a password.
